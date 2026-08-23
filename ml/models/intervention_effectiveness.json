@@ -1,0 +1,32 @@
+{
+  "retry": {
+    "effectiveness": 0.6375796178343949,
+    "mean_amount": 2500.547770700637,
+    "attempts": 3140,
+    "recovered_value": 5064260.0
+  },
+  "human_escalation": {
+    "effectiveness": 0.5051546391752577,
+    "mean_amount": 4214.103092783505,
+    "attempts": 485,
+    "recovered_value": 1112680.0
+  },
+  "reminder": {
+    "effectiveness": 0.46471226927252984,
+    "mean_amount": 2513.57220412595,
+    "attempts": 1842,
+    "recovered_value": 2187890.0
+  },
+  "alternative_payment_method": {
+    "effectiveness": 0.4645868465430017,
+    "mean_amount": 2499.7639123102867,
+    "attempts": 1186,
+    "recovered_value": 1401360.0
+  },
+  "customer_notification": {
+    "effectiveness": 0.4128159305591014,
+    "mean_amount": 2400.9724278784784,
+    "attempts": 3917,
+    "recovered_value": 3868240.0
+  }
+}

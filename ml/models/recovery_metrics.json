@@ -1,0 +1,51 @@
+{
+  "roc_auc": 0.6353282828282828,
+  "pr_auc": 0.6274807790022572,
+  "precision": 0.583030303030303,
+  "recall": 0.6073232323232324,
+  "f1": 0.5949288806431664,
+  "confusion_matrix": [
+    [
+      456,
+      344
+    ],
+    [
+      311,
+      481
+    ]
+  ],
+  "brier_score": 0.2369670588914847,
+  "train_rows": 7425,
+  "validation_rows": 1591,
+  "test_rows": 1592,
+  "failed_payment_rows": 10608,
+  "positive_rate": 0.4973604826546003,
+  "training_timestamp": "2026-08-23T17:02:58.588658+00:00",
+  "dataset_version": "synthetic-v2",
+  "feature_version": "v2",
+  "feature_columns": [
+    "amount",
+    "payment_method",
+    "failure_reason",
+    "failure_source",
+    "failure_step",
+    "customer_age_days",
+    "previous_payment_count",
+    "previous_success_count",
+    "previous_failure_count",
+    "customer_success_rate",
+    "average_transaction_amount",
+    "customer_lifetime_value",
+    "days_since_last_payment",
+    "retry_count",
+    "previous_recovery_count",
+    "historical_recovery_rate",
+    "previous_intervention",
+    "subscription_status",
+    "subscription_age_days",
+    "time_of_day",
+    "day_of_week",
+    "merchant_category",
+    "customer_segment"
+  ]
+}
