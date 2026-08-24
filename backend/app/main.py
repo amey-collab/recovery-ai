@@ -233,7 +233,7 @@ def agent_activity(s:Session=Depends(db),u:User=Depends(current)): return logs(s
 @app.get('/api/agents/decisions')
 def agent_decisions(s:Session=Depends(db),u:User=Depends(current)): return [x for x in logs(s,u) if x['agent']=='DecisionAgent']
 @app.get('/api/audit-logs')
-def logs(s:Session=Depends(db),u:User=Depends(authorize(Role.ADMIN.value,Role.ANALYST.value))): return [{'timestamp':x.created_at,'agent':x.agent,'payment_id':x.payment_id,'action':x.action,'reason':x.reason,'details':x.details} for x in s.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(200)).all()]
+def logs(s:Session=Depends(db),u:User=Depends(current)): return [{'timestamp':x.created_at,'agent':x.agent,'payment_id':x.payment_id,'action':x.action,'reason':x.reason,'details':x.details} for x in s.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(200)).all()]
 @app.post('/api/razorpay/orders')
 def create_order(x:PaymentIn,u:User=Depends(authorize(Role.ADMIN.value,Role.OPERATOR.value))): return razorpay_service.create_order(x.amount,x.currency,x.receipt or f'rai_{uuid.uuid4().hex[:20]}')
 @app.post('/api/webhooks/razorpay',status_code=200)
