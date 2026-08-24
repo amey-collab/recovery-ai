@@ -48,6 +48,9 @@ bash scripts/render_start.sh
 
 The wrapper validates Render's runtime `PORT`, binds Uvicorn to `0.0.0.0`,
 and uses `exec` so the web process remains attached to Render's port scan.
+For a one-time production demo-data population, set `RUN_SYNTHETIC_SEED=true`
+for one deploy; it creates four idempotent synthetic bundles before starting
+the server. Remove the variable or set it to `false` afterward.
 
 Configure `DATABASE_URL`, `APP_ENV`, `SECRET_KEY`, `CORS_ORIGINS`, and the required Test Mode Razorpay variables in Render's environment settings. Never commit `.env` or credentials.
 
