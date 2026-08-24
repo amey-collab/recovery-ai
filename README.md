@@ -32,6 +32,22 @@ Passwords are bcrypt hashes; JWT access is role-controlled (`ADMIN`, `ANALYST`, 
 
 `docker compose up --build` starts frontend, backend, PostgreSQL, and Redis. For production, use managed PostgreSQL, a secret manager, HTTPS/reverse proxy, migration jobs, restricted CORS, and a publicly routable signed webhook endpoint.
 
+## Render Free plan
+
+For a native Render Web Service on the Free plan, set the Build Command to:
+
+```bash
+bash scripts/render_build.sh
+```
+
+This installs `backend/requirements.txt` and runs `alembic upgrade head` against the Render-provided `DATABASE_URL` before the service starts. Keep the Start Command as:
+
+```bash
+cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Configure `DATABASE_URL`, `APP_ENV`, `SECRET_KEY`, `CORS_ORIGINS`, and the required Test Mode Razorpay variables in Render's environment settings. Never commit `.env` or credentials.
+
 ## Limitations
 
 The UI intentionally focuses on the operational dashboard while the backend offers the protected REST workflows. Add email/SMS delivery only behind a `NotificationService`, and replace the in-process pipeline with a worker when volume needs it.
