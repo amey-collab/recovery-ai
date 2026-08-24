@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -70,8 +70,18 @@ def authorize(*roles):
         if u.role not in roles: raise HTTPException(403,'Insufficient role')
         return u
     return dep
-class Register(BaseModel): email:EmailStr; password:str=Field(min_length=8)
-class Login(BaseModel): email:EmailStr; password:str
+def validate_password_bytes(value:str)->str:
+    if len(value.encode('utf-8'))>72:
+        raise ValueError('password must be 72 UTF-8 bytes or fewer')
+    return value
+class Register(BaseModel):
+    email:EmailStr
+    password:str=Field(min_length=8)
+    _password_limit=field_validator('password')(validate_password_bytes)
+class Login(BaseModel):
+    email:EmailStr
+    password:str
+    _password_limit=field_validator('password')(validate_password_bytes)
 class PaymentIn(BaseModel): amount:float=Field(gt=0); currency:str='INR'; receipt:str|None=None; customer_name:str='Test customer'; customer_email:EmailStr
 class RazorpayService:
     def client(self):

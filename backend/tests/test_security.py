@@ -1,10 +1,11 @@
 import sys
 from pathlib import Path
 import pytest
+import uuid
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from app.main import Register, Settings, app, settings
+from app.main import Register, Settings, User, SessionLocal, app, pwd, settings
 
 
 def test_production_missing_jwt_secret_fails_safely():
@@ -19,6 +20,30 @@ def test_production_wildcard_cors_fails_safely():
 
 def test_registration_cannot_self_assign_privileged_role():
     assert 'role' not in Register.model_fields
+
+
+def test_registration_and_password_verification():
+    email=f'password-test-{uuid.uuid4().hex}@example.com'
+    password='RecoverAI-normal-password-2026!'
+    with TestClient(app) as client:
+        response=client.post('/api/auth/register',json={'email':email,'password':password})
+        assert response.status_code==200
+        login=client.post('/api/auth/login',json={'email':email,'password':password})
+        assert login.status_code==200
+        assert login.json().get('access_token')
+    s=SessionLocal()
+    try:
+        user=s.query(User).filter(User.email==email).one()
+        assert pwd.verify(password,user.password_hash)
+    finally:
+        s.delete(user);s.commit();s.close()
+
+
+def test_password_over_bcrypt_byte_limit_is_rejected_without_truncation():
+    with TestClient(app) as client:
+        response=client.post('/api/auth/register',json={'email':f'long-{uuid.uuid4().hex}@example.com','password':'x'*73})
+    assert response.status_code==422
+    assert '72 UTF-8 bytes' in response.text
 
 
 def test_sensitive_endpoint_requires_authentication():
