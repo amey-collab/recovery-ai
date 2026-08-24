@@ -246,15 +246,19 @@ async def webhook(request:Request,s:Session=Depends(db)):
     except (json.JSONDecodeError,UnicodeDecodeError): raise HTTPException(400,'Malformed JSON webhook payload')
     if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
     event_type=payload.get('event',''); event_hash=hashlib.sha256(raw).hexdigest()
-    supported={'payment.failed','payment.authorized','payment.captured','order.paid'}
+    supported={'payment.failed','payment.authorized','payment.captured','payment_link.paid','order.paid'}
     if not event_type: raise HTTPException(400,'Missing webhook event type')
     if s.scalar(select(Event).where(Event.event_hash==event_hash)): return {'status':'duplicate'}
-    s.add(Event(event_hash=event_hash,event_type=event_type,payload=payload)); container=payload.get('payload') or {}; entity=(container.get('payment') or {}).get('entity') or {}; order_entity=(container.get('order') or {}).get('entity') or {}
+    s.add(Event(event_hash=event_hash,event_type=event_type,payload=payload)); container=payload.get('payload') or {}; entity=(container.get('payment') or {}).get('entity') or {}; payment_link_entity=(container.get('payment_link') or {}).get('entity') or {}; order_entity=(container.get('order') or {}).get('entity') or {}
     if event_type not in supported:
         s.commit(); return {'status':'ignored','event':event_type}
     if event_type.startswith('payment.'):
         if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
         if event_type in {'payment.failed','payment.authorized','payment.captured'} and entity.get('amount') is None: raise HTTPException(400,'Missing payment amount')
+    if event_type=='payment_link.paid':
+        if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
+        if entity.get('amount') is None and payment_link_entity.get('amount_paid') is None and payment_link_entity.get('amount') is None:
+            raise HTTPException(400,'Missing payment amount')
     if event_type=='payment.failed':
         ext=entity.get('id'); p=s.scalar(select(Payment).where(Payment.external_id==ext))
         if not p:
@@ -271,6 +275,30 @@ async def webhook(request:Request,s:Session=Depends(db)):
                 opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
                 if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
                     OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(entity['amount'])/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
+    elif event_type=='payment_link.paid':
+        # Payment Link webhooks contain the payment, order, and link entities
+        # under separate payload keys. A paid link is a successful collection,
+        # not a failed-payment recovery opportunity, so it is persisted as a
+        # captured payment without inventing a recovery action/outcome.
+        ext=entity['id']; p=s.scalar(select(Payment).where(Payment.external_id==ext))
+        amount_subunits=entity.get('amount') or payment_link_entity.get('amount_paid') or payment_link_entity.get('amount')
+        customer_details=payment_link_entity.get('customer_details') or {}
+        customer_ref=entity.get('email') or customer_details.get('email') or f'anon-{ext}'
+        if not p:
+            c=s.scalar(select(Customer).where(Customer.external_id==customer_ref))
+            if not c:
+                c=Customer(external_id=customer_ref,name=entity.get('email') or customer_details.get('name') or 'Razorpay Payment Link customer',email=entity.get('email') or customer_details.get('email') or 'unknown@example.invalid');s.add(c);s.flush()
+            p=Payment(external_id=ext,customer_id=c.id,order_id=entity.get('order_id') or payment_link_entity.get('order_id') or order_entity.get('id'),amount=float(amount_subunits)/100,currency=entity.get('currency') or payment_link_entity.get('currency') or 'INR',method=entity.get('method','payment_link'),status='captured',failure_reason=None);s.add(p)
+        else:
+            p.status='captured';p.failure_reason=None
+        s.flush()
+        # If a non-simulated recovery action already exists, a captured event
+        # may verify it through the existing OutcomeService. Simulated actions
+        # are deliberately never converted into real recovered revenue.
+        opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
+        if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
+            from app.outcome_service import OutcomeService, OutcomeStatus
+            OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(amount_subunits)/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
     elif event_type=='order.paid' and not order_entity.get('id'):
         raise HTTPException(400,'Missing order entity id')
     s.commit();return {'status':'processed','event':event_type}

@@ -20,7 +20,7 @@ cd backend; pytest
 
 ## Razorpay Test Mode
 
-Use Test Mode keys only. Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET`; no browser credential is ever embedded. The backend uses the official Python SDK to create Orders and fetch Payments. Amounts are converted to currency subunits. Configure the public webhook URL as `https://<tunnel-or-host>/api/webhooks/razorpay`, select `payment.failed`, `payment.authorized`, `payment.captured`, and `order.paid`, and set the same secret locally. A tunnel/deployment is required for Razorpay to reach a local backend. Webhook signatures are verified against the raw request body and duplicates are idempotently ignored.
+Use Test Mode keys only. Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET`; no browser credential is ever embedded. The backend uses the official Python SDK to create Orders and fetch Payments. Amounts are converted to currency subunits. Configure the public webhook URL as `https://<tunnel-or-host>/api/webhooks/razorpay`, select `payment.failed`, `payment.authorized`, `payment.captured`, `payment_link.paid`, and `order.paid`, and set the same secret locally. A tunnel/deployment is required for Razorpay to reach a local backend. Webhook signatures are verified against the raw request body and duplicates are idempotently ignored.
 
 Payment collection is not a recovery API. Razorpay’s Payments API is used only for its documented fetching/capture lifecycle. Recovery execution is intentionally labelled simulation until a later real test payment/webhook proves the outcome.
 

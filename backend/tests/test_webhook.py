@@ -11,6 +11,8 @@ def signed(payload,secret=None):
  raw=json.dumps(payload,separators=(',',':')).encode(); key=(secret or TEST_SECRET).encode(); return raw,hmac.new(key,raw,hashlib.sha256).hexdigest()
 def event(marker,kind='payment.failed'):
  return {'event':kind,'payload':{'payment':{'entity':{'id':'pay_web_'+marker,'order_id':'ord_web_'+marker,'amount':499900,'currency':'INR','method':'card','email':marker+'@example.test','error_description':'synthetic test bank error'}}}}
+def payment_link_event(marker):
+ return {'event':'payment_link.paid','payload':{'payment_link':{'entity':{'id':'plink_'+marker,'order_id':'order_link_'+marker,'amount':125000,'currency':'INR','customer_details':{'name':'Payment Link Test','email':marker+'@example.test'}}},'order':{'entity':{'id':'order_link_'+marker,'amount':125000,'currency':'INR'}},'payment':{'entity':{'id':'pay_link_'+marker,'order_id':'order_link_'+marker,'amount':125000,'currency':'INR','method':'card','email':marker+'@example.test'}}}}
 def cleanup(marker):
  s=SessionLocal();p=s.scalar(select(Payment).where(Payment.external_id=='pay_web_'+marker));
  if p:
@@ -46,3 +48,20 @@ def test_supported_non_failure_events_are_recognized():
  with TestClient(app) as c:
   for kind,body in [('payment.authorized',{'payment':{'entity':{'id':'pay_unknown_authorized_'+marker,'amount':100,'currency':'INR'}}}),('payment.captured',{'payment':{'entity':{'id':'pay_unknown_captured_'+marker,'amount':100,'currency':'INR'}}}),('order.paid',{'order':{'entity':{'id':'order_local_supported_'+marker}}})]:
    raw,sig=signed({'event':kind,'payload':body});r=c.post('/api/webhooks/razorpay',content=raw,headers={'X-Razorpay-Signature':sig});assert r.status_code==200 and r.json()['status']=='processed'
+
+def test_payment_link_paid_creates_captured_payment_and_is_idempotent():
+ marker=uuid.uuid4().hex;payload=payment_link_event(marker);raw,sig=signed(payload)
+ try:
+  with TestClient(app) as c:
+   first=c.post('/api/webhooks/razorpay',content=raw,headers={'X-Razorpay-Signature':sig});second=c.post('/api/webhooks/razorpay',content=raw,headers={'X-Razorpay-Signature':sig})
+  assert first.status_code==200 and first.json()['status']=='processed';assert second.status_code==200 and second.json()['status']=='duplicate'
+  s=SessionLocal();p=s.scalar(select(Payment).where(Payment.external_id=='pay_link_'+marker));assert p and p.status=='captured' and p.amount==1250
+  assert s.scalar(select(Customer).where(Customer.external_id==marker+'@example.test'));assert not s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id));assert s.scalar(select(Event).where(Event.event_type=='payment_link.paid',Event.payload['event'].as_string()=='payment_link.paid'));assert s.query(Payment).filter(Payment.external_id=='pay_link_'+marker).count()==1
+  s.close()
+ finally:
+  s=SessionLocal();p=s.scalar(select(Payment).where(Payment.external_id=='pay_link_'+marker));
+  if p:
+   s.execute(delete(Payment).where(Payment.id==p.id));s.execute(delete(Customer).where(Customer.external_id==marker+'@example.test'))
+  for e in s.scalars(select(Event).where(Event.event_type=='payment_link.paid')).all():
+   if marker in json.dumps(e.payload):s.delete(e)
+  s.commit();s.close()

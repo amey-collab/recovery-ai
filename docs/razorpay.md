@@ -8,7 +8,7 @@ The local endpoint is:
 POST http://localhost:8000/api/webhooks/razorpay
 ```
 
-The handler verifies HMAC-SHA256 over the exact raw request body using `RAZORPAY_WEBHOOK_SECRET` and compares it with `X-Razorpay-Signature`. Invalid signatures, malformed JSON, and missing required entity fields are rejected. Events are idempotent by SHA-256 hash of the raw payload. `payment.failed` creates/updates the payment and runs the ML recovery pipeline; `payment.authorized` and `payment.captured` update an existing payment without creating a recovery opportunity; `order.paid` is recognized without inventing unsupported order behavior. Unknown events are persisted and safely returned as ignored.
+The handler verifies HMAC-SHA256 over the exact raw request body using `RAZORPAY_WEBHOOK_SECRET` and compares it with `X-Razorpay-Signature`. Invalid signatures, malformed JSON, and missing required entity fields are rejected. Events are idempotent by SHA-256 hash of the raw payload. `payment.failed` creates/updates the payment and runs the ML recovery pipeline; `payment.authorized` and `payment.captured` update an existing payment without creating a recovery opportunity; `payment_link.paid` extracts the nested payment, order, and payment-link entities and creates a captured payment when it does not already exist; `order.paid` is recognized without inventing unsupported order behavior. Unknown events are persisted and safely returned as ignored.
 
 Run a synthetic local test while the backend is running:
 
