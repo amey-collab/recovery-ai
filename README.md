@@ -43,8 +43,11 @@ bash scripts/render_build.sh
 This installs `backend/requirements.txt` and runs `alembic upgrade head` against the Render-provided `DATABASE_URL` before the service starts. Keep the Start Command as:
 
 ```bash
-cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+bash scripts/render_start.sh
 ```
+
+The wrapper validates Render's runtime `PORT`, binds Uvicorn to `0.0.0.0`,
+and uses `exec` so the web process remains attached to Render's port scan.
 
 Configure `DATABASE_URL`, `APP_ENV`, `SECRET_KEY`, `CORS_ORIGINS`, and the required Test Mode Razorpay variables in Render's environment settings. Never commit `.env` or credentials.
 
