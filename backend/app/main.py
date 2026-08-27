@@ -91,13 +91,14 @@ class RazorpayService:
     def create_order(self,amount,currency,receipt): return self.client().order.create({'amount':round(amount*100),'currency':currency,'receipt':receipt[:40]})
     def fetch_payment(self,payment_id): return self.client().payment.fetch(payment_id)
 razorpay_service=RazorpayService()
+def utc_naive(): return datetime.now(timezone.utc).replace(tzinfo=None)
 class GuardrailEngine:
     MAX_AUTO=10000; MAX_RETRIES=2; MIN_PROB=.35; COOLDOWN_MINUTES=60
     def check(self,s:Session,p:Payment,prob:float,action:str):
         reasons=[]
         if p.retry_count>=self.MAX_RETRIES and action=='RETRY': return {'pass':False,'decision_status':'BLOCKED','reasons':['maximum retry count reached']}
         if prob<self.MIN_PROB: return {'pass':False,'decision_status':'NO_ACTION','reasons':['below confidence threshold']}
-        recent=s.scalar(select(RecoveryAction).join(Opportunity,RecoveryAction.opportunity_id==Opportunity.id).where(Opportunity.payment_id==p.id,RecoveryAction.created_at>=datetime.now(timezone.utc)-timedelta(minutes=self.COOLDOWN_MINUTES)))
+        recent=s.scalar(select(RecoveryAction).join(Opportunity,RecoveryAction.opportunity_id==Opportunity.id).where(Opportunity.payment_id==p.id,RecoveryAction.created_at>=utc_naive()-timedelta(minutes=self.COOLDOWN_MINUTES)))
         if recent:return {'pass':False,'decision_status':'BLOCKED','reasons':['recovery cooldown active']}
         if p.amount>self.MAX_AUTO:return {'pass':False,'decision_status':'HUMAN_REVIEW','reasons':['amount exceeds automatic recovery limit']}
         if action=='NO_ACTION':return {'pass':False,'decision_status':'NO_ACTION','reasons':['no positive intervention value']}
@@ -145,6 +146,53 @@ def pipeline(s:Session,p:Payment):
     orchestration=RecoveryOrchestrator(s).assess(p)
     if not orchestration.detection.detected or not orchestration.decision: return None
     d=orchestration.decision; factors={'customer_success_rate':p.customer.success_rate if p.customer else .5,'retry_count':p.retry_count,'failure_reason':p.failure_reason or 'unknown','decision_reason':d.reasons,'prediction_source':d.prediction_source};s.add(Prediction(payment_id=p.id,probability=d.recovery_probability,model_version=d.model_version,factors=factors));s.add(InterventionScore(payment_id=p.id,scores=d.intervention_rankings));opp=Opportunity(payment_id=p.id,state=d.decision_status,priority=d.priority,expected_value=d.expected_recovery_value,recommended_action=d.recommended_action,guardrail_result=d.guardrail_result);s.add(opp);return opp
+def razorpay_entity(container:dict,key:str)->dict:
+    block=container.get(key)
+    if not isinstance(block,dict): return {}
+    nested=block.get('entity')
+    if isinstance(nested,dict): return nested
+    return block if block.get('id') else {}
+def razorpay_amount(*values)->float|None:
+    for value in values:
+        if value is None or value=='': continue
+        try: return float(value)/100.0
+        except (TypeError,ValueError): continue
+    return None
+def upsert_webhook_customer(s:Session,entity:dict,payment_link_entity:dict|None=None)->Customer:
+    details=(payment_link_entity or {}).get('customer_details')
+    details=details if isinstance(details,dict) else {}
+    raw_email=entity.get('email') or details.get('email') or ''
+    email=raw_email.strip() if isinstance(raw_email,str) else ''
+    raw_contact=entity.get('contact') or details.get('contact') or ''
+    contact=str(raw_contact).strip()
+    ext=email or contact or f"anon-{entity.get('id') or (payment_link_entity or {}).get('id') or uuid.uuid4().hex}"
+    customer=s.scalar(select(Customer).where(Customer.external_id==ext))
+    if customer: return customer
+    name=details.get('name') or email or contact or 'Razorpay customer'
+    customer=Customer(external_id=ext,name=str(name),email=email or 'unknown@example.invalid');s.add(customer);s.flush();return customer
+def signature_valid(raw:bytes,signature:str)->bool:
+    expected=hmac.new(settings.razorpay_webhook_secret.encode(),raw,hashlib.sha256).hexdigest()
+    if not signature or len(signature)!=len(expected): return False
+    return hmac.compare_digest(expected,signature)
+def ingest_failed_payment(s:Session,entity:dict,payment_link_entity:dict,order_entity:dict)->Payment|None:
+    ext=entity.get('id')
+    if not ext: return None
+    amount=razorpay_amount(entity.get('amount'),payment_link_entity.get('amount_paid'),payment_link_entity.get('amount'),order_entity.get('amount'))
+    if amount is None: return None
+    failure=entity.get('error_description') or entity.get('error_reason') or entity.get('error_code') or 'Payment failed'
+    method=entity.get('method') or 'unknown'
+    currency=entity.get('currency') or payment_link_entity.get('currency') or 'INR'
+    order_id=entity.get('order_id') or payment_link_entity.get('order_id') or order_entity.get('id')
+    p=s.scalar(select(Payment).where(Payment.external_id==ext))
+    if not p:
+        c=upsert_webhook_customer(s,entity,payment_link_entity)
+        p=Payment(external_id=ext,customer_id=c.id,order_id=order_id,amount=amount,currency=currency,method=method,status='failed',failure_reason=failure);s.add(p);s.flush()
+    else:
+        p.status='failed';p.failure_reason=failure or p.failure_reason;p.retry_count=p.retry_count or 0
+        if order_id: p.order_id=p.order_id or order_id
+    try: pipeline(s,p)
+    except Exception as exc: audit(s,p,'DetectionAgent','PIPELINE_ERROR',f'recovery pipeline failed: {type(exc).__name__}')
+    return p
 app=FastAPI(title='RecoverAI',version='1.0.0'); app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins.split(','),allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 @app.on_event('startup')
 def startup():
@@ -166,18 +214,18 @@ def login(x:Login,s:Session=Depends(db)):
 @app.get('/api/auth/me')
 def me(u:User=Depends(current)): return {'id':u.id,'email':u.email,'role':u.role}
 @app.get('/api/payments')
-def payments(s:Session=Depends(db),u:User=Depends(current)): return [{'payment_id':p.external_id,'amount':p.amount,'status':p.status,'method':p.method,'failure_reason':p.failure_reason} for p in s.scalars(select(Payment).order_by(Payment.created_at.desc())).all()]
+def payments(s:Session=Depends(db),u:User=Depends(current)): return [{'payment_id':p.external_id,'amount':p.amount,'status':p.status,'method':p.method,'payment_method':p.method,'failure_reason':p.failure_reason,'created_at':p.created_at,'order_id':p.order_id} for p in s.scalars(select(Payment).order_by(Payment.created_at.desc())).all()]
 @app.get('/api/payments/failed')
-def failed(s:Session=Depends(db),u:User=Depends(current)): return [p.external_id for p in s.scalars(select(Payment).where(Payment.status=='failed')).all()]
+def failed(s:Session=Depends(db),u:User=Depends(current)): return [p.external_id for p in s.scalars(select(Payment).where(Payment.status=='failed').order_by(Payment.created_at.desc())).all()]
 @app.get('/api/payments/{payment_id}')
 def payment_detail(payment_id:str,s:Session=Depends(db),u:User=Depends(current)):
     p=s.scalar(select(Payment).where(Payment.external_id==payment_id))
     if not p: raise HTTPException(404,'Payment not found')
     pred=s.scalar(select(Prediction).where(Prediction.payment_id==p.id).order_by(Prediction.created_at.desc()))
     opp=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id))
-    scores=s.scalar(select(InterventionScore).where(InterventionScore.payment_id==p.id).order_by(InterventionScore.created_at.desc()));return {'payment_id':p.external_id,'amount':p.amount,'currency':p.currency,'status':p.status,'failure_reason':p.failure_reason,'customer':{'id':p.customer.external_id if p.customer else None,'success_rate':p.customer.success_rate if p.customer else None},'prediction':{'probability':pred.probability,'factors':pred.factors,'model_version':pred.model_version} if pred else None,'intervention_scores':scores.scores if scores else {},'opportunity':{'id':opp.id,'state':opp.state,'action':opp.recommended_action,'expected_recovery_value':opp.expected_value,'priority':opp.priority,'guardrail':opp.guardrail_result} if opp else None}
+    scores=s.scalar(select(InterventionScore).where(InterventionScore.payment_id==p.id).order_by(InterventionScore.created_at.desc()));return {'payment_id':p.external_id,'amount':p.amount,'currency':p.currency,'status':p.status,'method':p.method,'payment_method':p.method,'failure_reason':p.failure_reason,'created_at':p.created_at,'order_id':p.order_id,'customer':{'id':p.customer.external_id if p.customer else None,'success_rate':p.customer.success_rate if p.customer else None},'prediction':{'probability':pred.probability,'factors':pred.factors,'model_version':pred.model_version} if pred else None,'intervention_scores':scores.scores if scores else {},'opportunity':{'id':opp.id,'state':opp.state,'action':opp.recommended_action,'expected_recovery_value':opp.expected_value,'priority':opp.priority,'guardrail':opp.guardrail_result} if opp else None}
 @app.get('/api/recovery/opportunities')
-def opportunities(s:Session=Depends(db),u:User=Depends(current)): return [{'id':o.id,'payment_id':o.payment.external_id,'customer_id':o.payment.customer.external_id if o.payment.customer else None,'amount':o.payment.amount,'failure_reason':o.payment.failure_reason,'state':o.state,'priority':o.priority,'recommended_action':o.recommended_action,'expected_recovery_value':o.expected_value,'guardrail':o.guardrail_result,'probability':s.scalar(select(Prediction.probability).where(Prediction.payment_id==o.payment_id).order_by(Prediction.created_at.desc()))} for o in s.scalars(select(Opportunity).order_by(Opportunity.expected_value.desc())).all()]
+def opportunities(s:Session=Depends(db),u:User=Depends(current)): return [{'id':o.id,'payment_id':o.payment.external_id,'customer_id':o.payment.customer.external_id if o.payment.customer else None,'amount':o.payment.amount,'failure_reason':o.payment.failure_reason,'state':o.state,'priority':o.priority,'recommended_action':o.recommended_action,'expected_recovery_value':o.expected_value,'guardrail':o.guardrail_result,'created_at':o.created_at,'probability':s.scalar(select(Prediction.probability).where(Prediction.payment_id==o.payment_id).order_by(Prediction.created_at.desc()))} for o in s.scalars(select(Opportunity).order_by(Opportunity.expected_value.desc())).all()]
 @app.get('/api/recovery/opportunities/{oid}')
 def opportunity_detail(oid:int,s:Session=Depends(db),u:User=Depends(current)):
     o=s.get(Opportunity,oid)
@@ -219,8 +267,8 @@ def run_prediction(pid:str,s:Session=Depends(db),u:User=Depends(authorize(Role.A
     pipeline(s,p);s.commit();return opportunity_detail(s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)).id,s,u)
 @app.get('/api/analytics/overview')
 def overview(s:Session=Depends(db),u:User=Depends(current)):
-    risk=s.scalar(select(func.coalesce(func.sum(Payment.amount),0)).where(Payment.status=='failed')); expected=s.scalar(select(func.coalesce(func.sum(Opportunity.expected_value),0))); recovered=s.scalar(select(func.coalesce(func.sum(Outcome.amount),0)).where(Outcome.success==True)); actions=s.scalar(select(func.count(RecoveryAction.id))); successes=s.scalar(select(func.count(Outcome.id)).where(Outcome.success==True))
-    return {'synthetic_demo':True,'revenue_at_risk':risk,'recovery_opportunity':expected,'recovered_revenue':recovered,'recovery_rate':round(recovered/risk,4) if risk else 0,'intervention_success_rate':round(successes/actions,4) if actions else 0,'active_actions':actions}
+    risk=s.scalar(select(func.coalesce(func.sum(Payment.amount),0)).where(Payment.status=='failed')); expected=s.scalar(select(func.coalesce(func.sum(Opportunity.expected_value),0))); recovered=s.scalar(select(func.coalesce(func.sum(Outcome.amount),0)).where(Outcome.success==True)); actions=s.scalar(select(func.count(RecoveryAction.id))); successes=s.scalar(select(func.count(Outcome.id)).where(Outcome.success==True)); live=s.scalar(select(func.count(Payment.id)).where(Payment.external_id.like('pay_%'))) or 0
+    return {'synthetic_demo':live==0,'revenue_at_risk':risk,'recovery_opportunity':expected,'recovered_revenue':recovered,'recovery_rate':round(recovered/risk,4) if risk else 0,'intervention_success_rate':round(successes/actions,4) if actions else 0,'active_actions':actions,'live_payments':live}
 @app.get('/api/analytics/recovery')
 def recovery_analytics(s:Session=Depends(db),u:User=Depends(current)): return overview(s,u)
 @app.get('/api/analytics/revenue-at-risk')
@@ -234,14 +282,18 @@ def agent_activity(s:Session=Depends(db),u:User=Depends(current)): return logs(s
 def agent_decisions(s:Session=Depends(db),u:User=Depends(current)): return [x for x in logs(s,u) if x['agent']=='DecisionAgent']
 @app.get('/api/audit-logs')
 def logs(s:Session=Depends(db),u:User=Depends(current)): return [{'timestamp':x.created_at,'agent':x.agent,'payment_id':x.payment_id,'action':x.action,'reason':x.reason,'details':x.details} for x in s.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(200)).all()]
+@app.get('/api/sync')
+def sync_state(s:Session=Depends(db),u:User=Depends(current)):
+    last_event=s.scalar(select(func.max(Event.created_at))); last_payment=s.scalar(select(func.max(Payment.created_at)))
+    def iso(value): return value.isoformat() if hasattr(value,'isoformat') else (str(value) if value else None)
+    return {'last_event_at':iso(last_event),'last_payment_at':iso(last_payment),'payment_count':s.scalar(select(func.count(Payment.id))) or 0,'failed_count':s.scalar(select(func.count(Payment.id)).where(Payment.status=='failed')) or 0,'opportunity_count':s.scalar(select(func.count(Opportunity.id))) or 0}
 @app.post('/api/razorpay/orders')
 def create_order(x:PaymentIn,u:User=Depends(authorize(Role.ADMIN.value,Role.OPERATOR.value))): return razorpay_service.create_order(x.amount,x.currency,x.receipt or f'rai_{uuid.uuid4().hex[:20]}')
 @app.post('/api/webhooks/razorpay',status_code=200)
 async def webhook(request:Request,s:Session=Depends(db)):
     raw=await request.body(); signature=request.headers.get('X-Razorpay-Signature','')
     if not settings.razorpay_webhook_secret: raise HTTPException(503,'Webhook secret is not configured')
-    expected=hmac.new(settings.razorpay_webhook_secret.encode(),raw,hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected,signature): raise HTTPException(400,'Invalid webhook signature')
+    if not signature_valid(raw,signature): raise HTTPException(400,'Invalid webhook signature')
     try: payload=json.loads(raw)
     except (json.JSONDecodeError,UnicodeDecodeError): raise HTTPException(400,'Malformed JSON webhook payload')
     if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
@@ -249,56 +301,40 @@ async def webhook(request:Request,s:Session=Depends(db)):
     supported={'payment.failed','payment.authorized','payment.captured','payment_link.paid','order.paid'}
     if not event_type: raise HTTPException(400,'Missing webhook event type')
     if s.scalar(select(Event).where(Event.event_hash==event_hash)): return {'status':'duplicate'}
-    s.add(Event(event_hash=event_hash,event_type=event_type,payload=payload)); container=payload.get('payload') or {}; entity=(container.get('payment') or {}).get('entity') or {}; payment_link_entity=(container.get('payment_link') or {}).get('entity') or {}; order_entity=(container.get('order') or {}).get('entity') or {}
+    s.add(Event(event_hash=event_hash,event_type=event_type,payload=payload)); container=payload.get('payload') or {};
+    if not isinstance(container,dict): container={}
+    entity=razorpay_entity(container,'payment'); payment_link_entity=razorpay_entity(container,'payment_link'); order_entity=razorpay_entity(container,'order')
     if event_type not in supported:
         s.commit(); return {'status':'ignored','event':event_type}
-    if event_type.startswith('payment.'):
-        if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
-        if event_type in {'payment.failed','payment.authorized','payment.captured'} and entity.get('amount') is None: raise HTTPException(400,'Missing payment amount')
-    if event_type=='payment_link.paid':
-        if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
-        if entity.get('amount') is None and payment_link_entity.get('amount_paid') is None and payment_link_entity.get('amount') is None:
-            raise HTTPException(400,'Missing payment amount')
-    if event_type=='payment.failed':
-        ext=entity.get('id'); p=s.scalar(select(Payment).where(Payment.external_id==ext))
-        if not p:
-            c=Customer(external_id=entity.get('email') or f'anon-{ext}',name=entity.get('email','Unknown'),email=entity.get('email','unknown@example.invalid'));s.add(c);s.flush();p=Payment(external_id=ext,customer_id=c.id,order_id=entity.get('order_id'),amount=entity.get('amount',0)/100,currency=entity.get('currency','INR'),method=entity.get('method','unknown'),status='failed',failure_reason=entity.get('error_description'));s.add(p);s.flush()
-        else:
-            p.status='failed';p.failure_reason=entity.get('error_description') or p.failure_reason;p.retry_count=p.retry_count or 0
-        pipeline(s,p)
-    elif event_type in {'payment.authorized','payment.captured'}:
-        p=s.scalar(select(Payment).where(Payment.external_id==entity['id']))
-        if p:
-            p.status='authorized' if event_type.endswith('authorized') else 'captured'
-            if event_type=='payment.captured':
+    if event_type.startswith('payment.') or event_type=='payment_link.paid':
+        if event_type=='payment.failed':
+            p=ingest_failed_payment(s,entity,payment_link_entity,order_entity)
+            if not p: raise HTTPException(400,'Missing payment entity id' if not entity.get('id') else 'Missing payment amount')
+        elif event_type in {'payment.authorized','payment.captured'}:
+            if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
+            if entity.get('amount') is None: raise HTTPException(400,'Missing payment amount')
+            p=s.scalar(select(Payment).where(Payment.external_id==entity['id']))
+            if p:
+                p.status='authorized' if event_type.endswith('authorized') else 'captured'
+                if event_type=='payment.captured':
+                    from app.outcome_service import OutcomeService, OutcomeStatus
+                    opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
+                    if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
+                        OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(entity['amount'])/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
+        elif event_type=='payment_link.paid':
+            if not entity.get('id'): raise HTTPException(400,'Missing payment entity id')
+            amount_subunits=entity.get('amount') if entity.get('amount') is not None else payment_link_entity.get('amount_paid') if payment_link_entity.get('amount_paid') is not None else payment_link_entity.get('amount')
+            if amount_subunits is None: raise HTTPException(400,'Missing payment amount')
+            ext=entity['id']; p=s.scalar(select(Payment).where(Payment.external_id==ext)); c=upsert_webhook_customer(s,entity,payment_link_entity)
+            if not p:
+                p=Payment(external_id=ext,customer_id=c.id,order_id=entity.get('order_id') or payment_link_entity.get('order_id') or order_entity.get('id'),amount=float(amount_subunits)/100,currency=entity.get('currency') or payment_link_entity.get('currency') or 'INR',method=entity.get('method') or 'payment_link',status='captured',failure_reason=None);s.add(p)
+            else:
+                p.status='captured';p.failure_reason=None;p.customer_id=p.customer_id or c.id
+            s.flush()
+            opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
+            if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
                 from app.outcome_service import OutcomeService, OutcomeStatus
-                opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
-                if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
-                    OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(entity['amount'])/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
-    elif event_type=='payment_link.paid':
-        # Payment Link webhooks contain the payment, order, and link entities
-        # under separate payload keys. A paid link is a successful collection,
-        # not a failed-payment recovery opportunity, so it is persisted as a
-        # captured payment without inventing a recovery action/outcome.
-        ext=entity['id']; p=s.scalar(select(Payment).where(Payment.external_id==ext))
-        amount_subunits=entity.get('amount') or payment_link_entity.get('amount_paid') or payment_link_entity.get('amount')
-        customer_details=payment_link_entity.get('customer_details') or {}
-        customer_ref=entity.get('email') or customer_details.get('email') or f'anon-{ext}'
-        if not p:
-            c=s.scalar(select(Customer).where(Customer.external_id==customer_ref))
-            if not c:
-                c=Customer(external_id=customer_ref,name=entity.get('email') or customer_details.get('name') or 'Razorpay Payment Link customer',email=entity.get('email') or customer_details.get('email') or 'unknown@example.invalid');s.add(c);s.flush()
-            p=Payment(external_id=ext,customer_id=c.id,order_id=entity.get('order_id') or payment_link_entity.get('order_id') or order_entity.get('id'),amount=float(amount_subunits)/100,currency=entity.get('currency') or payment_link_entity.get('currency') or 'INR',method=entity.get('method','payment_link'),status='captured',failure_reason=None);s.add(p)
-        else:
-            p.status='captured';p.failure_reason=None
-        s.flush()
-        # If a non-simulated recovery action already exists, a captured event
-        # may verify it through the existing OutcomeService. Simulated actions
-        # are deliberately never converted into real recovered revenue.
-        opportunity=s.scalar(select(Opportunity).where(Opportunity.payment_id==p.id)); action=s.scalar(select(RecoveryAction).where(RecoveryAction.opportunity_id==opportunity.id).order_by(RecoveryAction.created_at.desc())) if opportunity else None
-        if action and not action.simulated and not s.scalar(select(Outcome).where(Outcome.action_id==action.id)):
-            from app.outcome_service import OutcomeService, OutcomeStatus
-            OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(amount_subunits)/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
+                OutcomeService(s).record(action,OutcomeStatus.SUCCESS,recovered_amount=min(float(amount_subunits)/100,float(p.amount)),execution_mode='RAZORPAY_TEST')
     elif event_type=='order.paid' and not order_entity.get('id'):
         raise HTTPException(400,'Missing order entity id')
     s.commit();return {'status':'processed','event':event_type}

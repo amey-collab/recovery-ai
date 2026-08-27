@@ -1,15 +1,56 @@
 # RecoverAI
 
-RecoverAI is a modular fintech recovery platform: failed payment → prediction → expected-value intervention → deterministic guardrails → approved execution → verified outcome → analytics. Demo records are clearly synthetic.
+**Autonomous revenue recovery for failed payments — predicted, guarded, and audited.**
+
+RecoverAI turns Razorpay payment failures into a prioritized recovery queue: detect → diagnose → predict → rank interventions by expected value → apply deterministic guardrails → approve/execute → verify outcomes → analytics.
+
+<p align="center">
+  <img src="docs/images/dashboard.png" alt="RecoverAI dashboard with live inbound payments and recovery metrics" width="920" />
+</p>
+
+## Product tour
+
+| Sign in | Live dashboard | Recovery queue |
+| --- | --- | --- |
+| <img src="docs/images/login.png" alt="RecoverAI sign-in experience" width="280" /> | <img src="docs/images/dashboard.png" alt="RecoverAI operator dashboard" width="280" /> | <img src="docs/images/recovery.png" alt="RecoverAI recovery opportunities table" width="280" /> |
+
+- **Live webhook feed** — failed Payment Links and `payment.failed` events surface on the dashboard within seconds
+- **ML-backed ranking** — recovery probability and intervention expected value from trained local models
+- **Hard guardrails** — amount caps, retry limits, confidence thresholds, and human review gates
+- **Full audit trail** — every agent decision is recorded for operators and reviewers
+
+## Architecture
+
+```text
+Razorpay webhook → idempotent event store → Payment
+  → DetectionAgent → DiagnosisAgent → ML prediction / intervention ranking
+  → DecisionAgent → GuardrailEngine → approval → ExecutionAgent
+  → OutcomeAgent → analytics / audit
+```
 
 ## Run locally
 
-1. Copy `.env.example` to `.env`, set a strong `SECRET_KEY`, and use PostgreSQL (SQLite is retained only as a simple no-infrastructure fallback).
-2. `cd backend; python -m venv .venv; .venv\\Scripts\\pip install -r requirements.txt; .venv\\Scripts\\uvicorn app.main:app --reload`
-3. `cd frontend; npm install; npm run dev`
-4. Register an administrator at `POST /api/auth/register`, then sign in at `http://localhost:5173`.
+1. Copy `.env.example` to `.env`, set a strong `SECRET_KEY`, and prefer PostgreSQL (SQLite works as a no-infrastructure fallback).
+2. Start the API:
 
-Generate data and train real local models:
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\uvicorn app.main:app --reload
+```
+
+3. Start the UI:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+4. Register the first administrator with `POST /api/auth/register`, then open [http://localhost:5173](http://localhost:5173).
+
+### Seed data and train models
 
 ```powershell
 python ml/data_generator.py --rows 100000
@@ -20,40 +61,72 @@ cd backend; pytest
 
 ## Razorpay Test Mode
 
-Use Test Mode keys only. Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET`; no browser credential is ever embedded. The backend uses the official Python SDK to create Orders and fetch Payments. Amounts are converted to currency subunits. Configure the public webhook URL as `https://<tunnel-or-host>/api/webhooks/razorpay`, select `payment.failed`, `payment.authorized`, `payment.captured`, `payment_link.paid`, and `order.paid`, and set the same secret locally. A tunnel/deployment is required for Razorpay to reach a local backend. Webhook signatures are verified against the raw request body and duplicates are idempotently ignored.
+Use **Test Mode** credentials only:
 
-Payment collection is not a recovery API. Razorpay’s Payments API is used only for its documented fetching/capture lifecycle. Recovery execution is intentionally labelled simulation until a later real test payment/webhook proves the outcome.
+| Variable | Purpose |
+| --- | --- |
+| `RAZORPAY_KEY_ID` | Test key id |
+| `RAZORPAY_KEY_SECRET` | Test key secret |
+| `RAZORPAY_WEBHOOK_SECRET` | Webhook HMAC secret (different from the API secret) |
+| `RAZORPAY_MODE` | Must stay `test` |
+
+Configure the webhook URL as:
+
+```text
+https://<tunnel-or-host>/api/webhooks/razorpay
+```
+
+Subscribe at least to:
+
+- `payment.failed` *(required for Payment Link Failure in test mode)*
+- `payment.authorized`
+- `payment.captured`
+- `payment_link.paid`
+- `order.paid`
+
+Signatures are verified over the raw body; duplicates are ignored by payload hash. Razorpay cannot reach `localhost` directly — use a tunnel or deployed HTTPS endpoint.
+
+Local synthetic webhook smoke test:
+
+```powershell
+python scripts/test_razorpay_webhook.py
+```
 
 ## Security and limits
 
-Passwords are bcrypt hashes; JWT access is role-controlled (`ADMIN`, `ANALYST`, `OPERATOR`, `VIEWER`). Guardrails cap auto-recovery at ₹10,000, max retries at two, and require confidence ≥ .35. The LLM is optional and can never execute an action or alter guardrails.
+- Passwords are bcrypt-hashed; access is JWT + role gated (`ADMIN`, `ANALYST`, `OPERATOR`, `VIEWER`)
+- Auto-recovery capped at ₹10,000, max 2 retries, confidence ≥ 0.35
+- Optional LLM explanations never authorize or execute recovery actions
+- Secrets stay in `.env` / host environment — never in the browser
 
 ## Docker
 
-`docker compose up --build` starts frontend, backend, PostgreSQL, and Redis. For production, use managed PostgreSQL, a secret manager, HTTPS/reverse proxy, migration jobs, restricted CORS, and a publicly routable signed webhook endpoint.
+```powershell
+docker compose up --build
+```
+
+Starts frontend, backend, PostgreSQL, and Redis. Production should use managed Postgres, a secret manager, HTTPS, migrations, restricted CORS, and a publicly routable signed webhook.
 
 ## Render Free plan
 
-For a native Render Web Service on the Free plan, set the Build Command to:
+**Build command**
 
 ```bash
 bash scripts/render_build.sh
 ```
 
-This installs `backend/requirements.txt` and runs `alembic upgrade head` against the Render-provided `DATABASE_URL` before the service starts. Keep the Start Command as:
+**Start command**
 
 ```bash
 bash scripts/render_start.sh
 ```
 
-The wrapper validates Render's runtime `PORT`, binds Uvicorn to `0.0.0.0`,
-and uses `exec` so the web process remains attached to Render's port scan.
-For a one-time production demo-data population, set `RUN_SYNTHETIC_SEED=true`
-for one deploy; it creates four idempotent synthetic bundles before starting
-the server. Remove the variable or set it to `false` afterward.
-
-Configure `DATABASE_URL`, `APP_ENV`, `SECRET_KEY`, `CORS_ORIGINS`, and the required Test Mode Razorpay variables in Render's environment settings. Never commit `.env` or credentials.
+Set `DATABASE_URL`, `APP_ENV`, `SECRET_KEY`, `CORS_ORIGINS`, and Razorpay Test Mode variables in the Render dashboard. For a one-time demo seed, set `RUN_SYNTHETIC_SEED=true` for a single deploy, then turn it off.
 
 ## Limitations
 
-The UI intentionally focuses on the operational dashboard while the backend offers the protected REST workflows. Add email/SMS delivery only behind a `NotificationService`, and replace the in-process pipeline with a worker when volume needs it.
+The UI focuses on the operator console. Email/SMS delivery should sit behind a future `NotificationService`, and high volume should move the recovery pipeline to a worker.
+
+## License / status
+
+Internal product codebase. Demo and synthetic records are labelled in the workspace.
