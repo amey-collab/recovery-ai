@@ -25,8 +25,8 @@ api.interceptors.response.use(
 
 export const authApi = {
   login: (payload: { email: string; password: string }) => api.post('/api/auth/login', payload),
+  register: (payload: { email: string; password: string }) => api.post('/api/auth/register', payload),
   me: () => api.get('/api/auth/me'),
 };
 
 export const getData = <T>(url: string) => api.get<T>(url).then((r) => r.data);
-

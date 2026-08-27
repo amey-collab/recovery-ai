@@ -773,6 +773,7 @@ code {
 }
 
 .form-error { font-size: 13px; font-weight: 600; }
+.form-success { color: var(--success); background: #eaf8f0; border: 1px solid #b8e4ca; border-radius: 8px; padding: 11px; margin: 16px 0; font-size: 13px; font-weight: 600; }
 .login-card > small {
   display: block;
   color: var(--muted);
